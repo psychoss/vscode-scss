@@ -1,0 +1,46 @@
+{
+  "name": "vscode-scss",
+  "displayName": "vscode-scss",
+  "description": "",
+  "version": "0.0.1",
+  "publisher": "psycho",
+  "engines": {
+    "vscode": "^0.10.1"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onCommand:extension.formatscss",
+    "onCommand:extension.compilescss"
+  ],
+  "main": "./extension",
+  "contributes": {
+    "commands": [
+      {
+        "command": "extension.formatscss",
+        "title": "Format SCSS"
+      },
+      {
+        "command": "extension.compilescss",
+        "title": "Compile SCSS"
+      }
+    ],
+    "keybindings": [
+      {
+        "command": "extension.formatscss",
+        "key": "F9"
+      },
+      {
+        "command": "extension.compilescss",
+        "key": "F10"
+      }
+    ]
+  },
+  "devDependencies": {
+    "vscode": "0.10.x"
+  },
+  "dependencies": {
+    "node-sass": "^3.4.2"
+  }
+}
