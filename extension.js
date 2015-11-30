@@ -1,450 +1,433 @@
 // The module 'vscode' contains the VS Code extensibility API
 // Import the module and reference it with the alias vscode in your code below
 var vscode = require('vscode');
-var sass = require("node-sass");
+var ass = require("node-sass");
 var fs = require("fs");
 
-function cssbeautify(style, opt) {
+function css_beautify(source_text, options) {
+    options = options || {};
+    source_text = source_text || '';
+    // HACK: newline parsing inconsistent. This brute force normalizes the input.
+    source_text = source_text.replace(/\r\n|[\r\u2028\u2029]/g, '\n')
 
-    var options, index = 0, length = style.length, blocks, formatted = '',
-        ch, ch2, str, state, State, depth, quote, comment,
-        openbracesuffix = true,
-        autosemicolon = false,
-        trimRight;
+    var indentSize = options.indent_size || 4;
+    var indentCharacter = options.indent_char || ' ';
+    var selectorSeparatorNewline = (options.selector_separator_newline === undefined) ? true : options.selector_separator_newline;
+    var end_with_newline = (options.end_with_newline === undefined) ? false : options.end_with_newline;
+    var newline_between_rules = (options.newline_between_rules === undefined) ? true : options.newline_between_rules;
+    var eol = options.eol ? options.eol : '\n';
 
-    options = arguments.length > 1 ? opt : {};
-    if (typeof options.indent === 'undefined') {
-        options.indent = '    ';
-    }
-    if (typeof options.openbrace === 'string') {
-        openbracesuffix = (options.openbrace === 'end-of-line');
-    }
-    if (typeof options.autosemicolon === 'boolean') {
-        autosemicolon = options.autosemicolon;
-    }
-
-    function isWhitespace(c) {
-        return (c === ' ') || (c === '\n') || (c === '\t') || (c === '\r') || (c === '\f');
+    // compatibility
+    if (typeof indentSize === "string") {
+        indentSize = parseInt(indentSize, 10);
     }
 
-    function isQuote(c) {
-        return (c === '\'') || (c === '"');
+    if (options.indent_with_tabs) {
+        indentCharacter = '\t';
+        indentSize = 1;
     }
 
-    // FIXME: handle Unicode characters
-    function isName(c) {
-        return (ch >= 'a' && ch <= 'z') ||
-            (ch >= 'A' && ch <= 'Z') ||
-            (ch >= '0' && ch <= '9') ||
-            '-_*.:#[]'.indexOf(c) >= 0;
+    eol = eol.replace(/\\r/, '\r').replace(/\\n/, '\n')
+
+
+    // tokenizer
+    var whiteRe = /^\s+$/;
+    var wordRe = /[\w$\-_]/;
+
+    var pos = -1,
+        ch;
+    var parenLevel = 0;
+
+    function next() {
+        ch = source_text.charAt(++pos);
+        return ch || '';
     }
 
-    function appendIndent() {
-        var i;
-        for (i = depth; i > 0; i -= 1) {
-            formatted += options.indent;
+    function peek(skipWhitespace) {
+        var result = '';
+        var prev_pos = pos;
+        if (skipWhitespace) {
+            eatWhitespace();
         }
+        result = source_text.charAt(pos + 1) || '';
+        pos = prev_pos - 1;
+        next();
+        return result;
     }
 
-    function openBlock() {
-        formatted = trimRight(formatted);
-        if (openbracesuffix) {
-            formatted += ' {';
-        } else {
-            formatted += '\n';
-            appendIndent();
-            formatted += '{';
+    function eatString(endChars) {
+        var start = pos;
+        while (next()) {
+            if (ch === "\\") {
+                next();
+            } else if (endChars.indexOf(ch) !== -1) {
+                break;
+            } else if (ch === "\n") {
+                break;
+            }
         }
-        if (ch2 !== '\n') {
-            formatted += '\n';
-        }
-        depth += 1;
+        return source_text.substring(start, pos + 1);
     }
 
-    function closeBlock() {
-        var last;
-        depth -= 1;
-        formatted = trimRight(formatted);
+    function peekString(endChar) {
+        var prev_pos = pos;
+        var str = eatString(endChar);
+        pos = prev_pos - 1;
+        next();
+        return str;
+    }
 
-        if (formatted.length > 0 && autosemicolon) {
-            last = formatted.charAt(formatted.length - 1);
-            if (last !== ';' && last !== '{') {
-                formatted += ';';
+    function eatWhitespace() {
+        var result = '';
+        while (whiteRe.test(peek())) {
+            next();
+            result += ch;
+        }
+        return result;
+    }
+
+    function skipWhitespace() {
+        var result = '';
+        if (ch && whiteRe.test(ch)) {
+            result = ch;
+        }
+        while (whiteRe.test(next())) {
+            result += ch;
+        }
+        return result;
+    }
+
+    function eatComment(singleLine) {
+        var start = pos;
+        singleLine = peek() === "/";
+        next();
+        while (next()) {
+            if (!singleLine && ch === "*" && peek() === "/") {
+                next();
+                break;
+            } else if (singleLine && ch === "\n") {
+                return source_text.substring(start, pos);
             }
         }
 
-        formatted += '\n';
-        appendIndent();
-        formatted += '}';
-        blocks.push(formatted);
-        formatted = '';
+        return source_text.substring(start, pos) + ch;
     }
 
-    if (String.prototype.trimRight) {
-        trimRight = function (s) {
-            return s.trimRight();
-        };
-    } else {
-        // old Internet Explorer
-        trimRight = function (s) {
-            return s.replace(/\s+$/, '');
-        };
+
+    function lookBack(str) {
+        return source_text.substring(pos - str.length, pos).toLowerCase() ===
+            str;
     }
 
-    State = {
-        Start: 0,
-        AtRule: 1,
-        Block: 2,
-        Selector: 3,
-        Ruleset: 4,
-        Property: 5,
-        Separator: 6,
-        Expression: 7,
-        URL: 8
+    // Nested pseudo-class if we are insideRule
+    // and the next special character found opens
+    // a new block
+    function foundNestedPseudoClass() {
+        var openParen = 0;
+        for (var i = pos + 1; i < source_text.length; i++) {
+            var ch = source_text.charAt(i);
+            if (ch === "{") {
+                return true;
+            } else if (ch === '(') {
+                // pseudoclasses can contain ()
+                openParen += 1;
+            } else if (ch === ')') {
+                if (openParen == 0) {
+                    return false;
+                }
+                openParen -= 1;
+            } else if (ch === ";" || ch === "}") {
+                return false;
+            }
+        }
+        return false;
+    }
+
+    // printer
+    var basebaseIndentString = source_text.match(/^[\t ]*/)[0];
+    var singleIndent = new Array(indentSize + 1).join(indentCharacter);
+    var indentLevel = 0;
+    var nestedLevel = 0;
+
+    function indent() {
+        indentLevel++;
+        basebaseIndentString += singleIndent;
+    }
+
+    function outdent() {
+        indentLevel--;
+        basebaseIndentString = basebaseIndentString.slice(0, -indentSize);
+    }
+
+    var print = {};
+    print["{"] = function(ch) {
+        print.singleSpace();
+        output.push(ch);
+        print.newLine();
+    };
+    print["}"] = function(ch) {
+        print.newLine();
+        output.push(ch);
+        print.newLine();
     };
 
-    depth = 0;
-    state = State.Start;
-    comment = false;
-    blocks = [];
+    print._lastCharWhitespace = function() {
+        return whiteRe.test(output[output.length - 1]);
+    };
 
-    // We want to deal with LF (\n) only
-    style = style.replace(/\r\n/g, '\n');
-
-    while (index < length) {
-        ch = style.charAt(index);
-        ch2 = style.charAt(index + 1);
-        index += 1;
-
-        // Inside a string literal?
-        if (isQuote(quote)) {
-            formatted += ch;
-            if (ch === quote) {
-                quote = null;
+    print.newLine = function(keepWhitespace) {
+        if (output.length) {
+            if (!keepWhitespace && output[output.length - 1] !== '\n') {
+                print.trim();
             }
-            if (ch === '\\' && ch2 === quote) {
-                // Don't treat escaped character as the closing quote
-                formatted += ch2;
-                index += 1;
+
+            output.push('\n');
+
+            if (basebaseIndentString) {
+                output.push(basebaseIndentString);
             }
-            continue;
         }
-
-        // Starting a string literal?
-        if (isQuote(ch)) {
-            formatted += ch;
-            quote = ch;
-            continue;
+    };
+    print.singleSpace = function() {
+        if (output.length && !print._lastCharWhitespace()) {
+            output.push(' ');
         }
+    };
 
-        // Comment
-        if (comment) {
-            formatted += ch;
-            if (ch === '*' && ch2 === '/') {
-                comment = false;
-                formatted += ch2;
-                index += 1;
+    print.preserveSingleSpace = function() {
+        if (isAfterSpace) {
+            print.singleSpace();
+        }
+    };
+
+    print.trim = function() {
+        while (print._lastCharWhitespace()) {
+            output.pop();
+        }
+    };
+
+
+    var output = [];
+    /*_____________________--------------------_____________________*/
+
+    var insideRule = false;
+    var insidePropertyValue = false;
+    var enteringConditionalGroup = false;
+    var top_ch = '';
+    var last_top_ch = '';
+
+    while (true) {
+        var whitespace = skipWhitespace();
+        var isAfterSpace = whitespace !== '';
+        var isAfterNewline = whitespace.indexOf('\n') !== -1;
+        last_top_ch = top_ch;
+        top_ch = ch;
+
+        if (!ch) {
+            break;
+        } else if (ch === '/' && peek() === '*') { /* css comment */
+            var header = indentLevel === 0;
+
+            if (isAfterNewline || header) {
+                print.newLine();
             }
-            continue;
-        }
-        if (ch === '/' && ch2 === '*') {
-            comment = true;
-            formatted += ch;
-            formatted += ch2;
-            index += 1;
-            continue;
-        }
 
-        if (state === State.Start) {
+            output.push(eatComment());
+            print.newLine();
+            if (header) {
+                print.newLine(true);
+            }
+        } else if (ch === '/' && peek() === '/') { // single line comment
+            if (!isAfterNewline && last_top_ch !== '{') {
+                print.trim();
+            }
+            print.singleSpace();
+            output.push(eatComment());
+            print.newLine();
+        } else if (ch === '@') {
+            print.preserveSingleSpace();
+            output.push(ch);
 
-            if (blocks.length === 0) {
-                if (isWhitespace(ch) && formatted.length === 0) {
-                    continue;
+            // strip trailing space, if present, for hash property checks
+            var variableOrRule = peekString(": ,;{}()[]/='\"");
+
+            if (variableOrRule.match(/[ :]$/)) {
+                // we have a variable or pseudo-class, add it and insert one space before continuing
+                next();
+                variableOrRule = eatString(": ").replace(/\s$/, '');
+                output.push(variableOrRule);
+                print.singleSpace();
+            }
+
+            variableOrRule = variableOrRule.replace(/\s$/, '')
+
+            // might be a nesting at-rule
+            if (variableOrRule in css_beautify.NESTED_AT_RULE) {
+                nestedLevel += 1;
+                if (variableOrRule in css_beautify.CONDITIONAL_GROUP_RULE) {
+                    enteringConditionalGroup = true;
                 }
             }
-
-            // Copy white spaces and control characters
-            if (ch <= ' ' || ch.charCodeAt(0) >= 128) {
-                state = State.Start;
-                formatted += ch;
-                continue;
-            }
-
-            // Selector or at-rule
-            if (isName(ch) || (ch === '@')) {
-
-                // Clear trailing whitespaces and linefeeds.
-                str = trimRight(formatted);
-
-                if (str.length === 0) {
-                    // If we have empty string after removing all the trailing
-                    // spaces, that means we are right after a block.
-                    // Ensure a blank line as the separator.
-                    if (blocks.length > 0) {
-                        formatted = '\n\n';
-                    }
+        } else if (ch === '#' && peek() === '{') {
+            print.preserveSingleSpace();
+            output.push(eatString('}'));
+        } else if (ch === '{') {
+            if (peek(true) === '}') {
+                eatWhitespace();
+                next();
+                print.singleSpace();
+                output.push("{}");
+                print.newLine();
+                if (newline_between_rules && indentLevel === 0) {
+                    print.newLine(true);
+                }
+            } else {
+                indent();
+                print["{"](ch);
+                // when entering conditional groups, only rulesets are allowed
+                if (enteringConditionalGroup) {
+                    enteringConditionalGroup = false;
+                    insideRule = (indentLevel > nestedLevel);
                 } else {
-                    // After finishing a ruleset or directive statement,
-                    // there should be one blank line.
-                    if (str.charAt(str.length - 1) === '}' ||
-                        str.charAt(str.length - 1) === ';') {
-
-                        formatted = str + '\n\n';
-                    } else {
-                        // After block comment, keep all the linefeeds but
-                        // start from the first column (remove whitespaces prefix).
-                        while (true) {
-                            ch2 = formatted.charAt(formatted.length - 1);
-                            if (ch2 !== ' ' && ch2.charCodeAt(0) !== 9) {
-                                break;
-                            }
-                            formatted = formatted.substr(0, formatted.length - 1);
-                        }
-                    }
+                    // otherwise, declarations are also allowed
+                    insideRule = (indentLevel >= nestedLevel);
                 }
-                formatted += ch;
-                state = (ch === '@') ? State.AtRule : State.Selector;
-                continue;
             }
-        }
-
-        if (state === State.AtRule) {
-
-            // ';' terminates a statement.
-            if (ch === ';') {
-                formatted += ch;
-                state = State.Start;
-                continue;
+        } else if (ch === '}') {
+            outdent();
+            print["}"](ch);
+            insideRule = false;
+            insidePropertyValue = false;
+            if (nestedLevel) {
+                nestedLevel--;
             }
-
-            // '{' starts a block
-            if (ch === '{') {
-                str = trimRight(formatted);
-                openBlock();
-                state = (str === '@font-face') ? State.Ruleset : State.Block;
-                continue;
+            if (newline_between_rules && indentLevel === 0) {
+                print.newLine(true);
             }
-
-            formatted += ch;
-            continue;
-        }
-
-        if (state === State.Block) {
-
-            // Selector
-            if (isName(ch)) {
-
-                // Clear trailing whitespaces and linefeeds.
-                str = trimRight(formatted);
-
-                if (str.length === 0) {
-                    // If we have empty string after removing all the trailing
-                    // spaces, that means we are right after a block.
-                    // Ensure a blank line as the separator.
-                    if (blocks.length > 0) {
-                        formatted = '\n\n';
-                    }
+        } else if (ch === ":") {
+            eatWhitespace();
+            if ((insideRule || enteringConditionalGroup) &&
+                !(lookBack("&") || foundNestedPseudoClass())) {
+                // 'property: value' delimiter
+                // which could be in a conditional group query
+                insidePropertyValue = true;
+                output.push(':');
+                print.singleSpace();
+            } else {
+                // sass/less parent reference don't use a space
+                // sass nested pseudo-class don't use a space
+                if (peek() === ":") {
+                    // pseudo-element
+                    next();
+                    output.push("::");
                 } else {
-                    // Insert blank line if necessary.
-                    if (str.charAt(str.length - 1) === '}') {
-                        formatted = str + '\n\n';
+                    // pseudo-class
+                    output.push(':');
+                }
+            }
+        } else if (ch === '"' || ch === '\'') {
+            print.preserveSingleSpace();
+            output.push(eatString(ch));
+        } else if (ch === ';') {
+            insidePropertyValue = false;
+            output.push(ch);
+            print.newLine();
+        } else if (ch === '(') { // may be a url
+            if (lookBack("url")) {
+                output.push(ch);
+                eatWhitespace();
+                if (next()) {
+                    if (ch !== ')' && ch !== '"' && ch !== '\'') {
+                        output.push(eatString(')'));
                     } else {
-                        // After block comment, keep all the linefeeds but
-                        // start from the first column (remove whitespaces prefix).
-                        while (true) {
-                            ch2 = formatted.charAt(formatted.length - 1);
-                            if (ch2 !== ' ' && ch2.charCodeAt(0) !== 9) {
-                                break;
-                            }
-                            formatted = formatted.substr(0, formatted.length - 1);
-                        }
+                        pos--;
                     }
                 }
-
-                appendIndent();
-                formatted += ch;
-                state = State.Selector;
-                continue;
+            } else {
+                parenLevel++;
+                print.preserveSingleSpace();
+                output.push(ch);
+                eatWhitespace();
             }
-
-            // '}' resets the state.
-            if (ch === '}') {
-                closeBlock();
-                state = State.Start;
-                continue;
+        } else if (ch === ')') {
+            output.push(ch);
+            parenLevel--;
+        } else if (ch === ',') {
+            output.push(ch);
+            eatWhitespace();
+            if (selectorSeparatorNewline && !insidePropertyValue && parenLevel < 1) {
+                print.newLine();
+            } else {
+                print.singleSpace();
             }
-
-            formatted += ch;
-            continue;
+        } else if (ch === ']') {
+            output.push(ch);
+        } else if (ch === '[') {
+            print.preserveSingleSpace();
+            output.push(ch);
+        } else if (ch === '=') { // no whitespace before or after
+            eatWhitespace()
+            ch = '=';
+            output.push(ch);
+        } else {
+            print.preserveSingleSpace();
+            output.push(ch);
         }
-
-        if (state === State.Selector) {
-
-            // '{' starts the ruleset.
-            if (ch === '{') {
-                openBlock();
-                state = State.Ruleset;
-                continue;
-            }
-
-            // '}' resets the state.
-            if (ch === '}') {
-                closeBlock();
-                state = State.Start;
-                continue;
-            }
-
-            formatted += ch;
-            continue;
-        }
-
-        if (state === State.Ruleset) {
-
-            // '}' finishes the ruleset.
-            if (ch === '}') {
-                closeBlock();
-                state = State.Start;
-                if (depth > 0) {
-                    state = State.Block;
-                }
-                continue;
-            }
-
-            // Make sure there is no blank line or trailing spaces inbetween
-            if (ch === '\n') {
-                formatted = trimRight(formatted);
-                formatted += '\n';
-                continue;
-            }
-
-            // property name
-            if (!isWhitespace(ch)) {
-                formatted = trimRight(formatted);
-                formatted += '\n';
-                appendIndent();
-                formatted += ch;
-                state = State.Property;
-                continue;
-            }
-            formatted += ch;
-            continue;
-        }
-
-        if (state === State.Property) {
-
-            // ':' concludes the property.
-            if (ch === ':') {
-                formatted = trimRight(formatted);
-                formatted += ': ';
-                state = State.Expression;
-                if (isWhitespace(ch2)) {
-                    state = State.Separator;
-                }
-                continue;
-            }
-
-            // '}' finishes the ruleset.
-            if (ch === '}') {
-                closeBlock();
-                state = State.Start;
-                if (depth > 0) {
-                    state = State.Block;
-                }
-                continue;
-            }
-
-            formatted += ch;
-            continue;
-        }
-
-        if (state === State.Separator) {
-
-            // Non-whitespace starts the expression.
-            if (!isWhitespace(ch)) {
-                formatted += ch;
-                state = State.Expression;
-                continue;
-            }
-
-            // Anticipate string literal.
-            if (isQuote(ch2)) {
-                state = State.Expression;
-            }
-
-            continue;
-        }
-
-        if (state === State.Expression) {
-
-            // '}' finishes the ruleset.
-            if (ch === '}') {
-                closeBlock();
-                state = State.Start;
-                if (depth > 0) {
-                    state = State.Block;
-                }
-                continue;
-            }
-
-            // ';' completes the declaration.
-            if (ch === ';') {
-                formatted = trimRight(formatted);
-                formatted += ';\n';
-                state = State.Ruleset;
-                continue;
-            }
-
-            formatted += ch;
-
-            if (ch === '(') {
-                if (formatted.charAt(formatted.length - 2) === 'l' &&
-                    formatted.charAt(formatted.length - 3) === 'r' &&
-                    formatted.charAt(formatted.length - 4) === 'u') {
-
-                    // URL starts with '(' and closes with ')'.
-                    state = State.URL;
-                    continue;
-                }
-            }
-
-            continue;
-        }
-
-        if (state === State.URL) {
-
-
-            // ')' finishes the URL (only if it is not escaped).
-            if (ch === ')' && formatted.charAt(formatted.length - 1 !== '\\')) {
-                formatted += ch;
-                state = State.Expression;
-                continue;
-            }
-        }
-
-        // The default action is to copy the character (to prevent
-        // infinite loop).
-        formatted += ch;
     }
 
-    formatted = blocks.join('') + formatted;
 
-    return formatted;
+    var sweetCode = '';
+    if (basebaseIndentString) {
+        sweetCode += basebaseIndentString;
+    }
+
+    sweetCode += output.join('').replace(/[\r\n\t ]+$/, '');
+
+    // establish end_with_newline
+    if (end_with_newline) {
+        sweetCode += '\n';
+    }
+
+    if (eol != '\n') {
+        sweetCode = sweetCode.replace(/[\n]/g, eol);
+    }
+
+    return sweetCode;
 }
+
+// https://developer.mozilla.org/en-US/docs/Web/CSS/At-rule
+css_beautify.NESTED_AT_RULE = {
+    "@page": true,
+    "@font-face": true,
+    "@keyframes": true,
+    // also in CONDITIONAL_GROUP_RULE below
+    "@media": true,
+    "@supports": true,
+    "@document": true
+};
+css_beautify.CONDITIONAL_GROUP_RULE = {
+    "@media": true,
+    "@supports": true,
+    "@document": true
+};
+
 
 // this method is called when your extension is activated
 // your extension is activated the very first time the command is executed
 function activate(context) {
-    var beautifulScss = function (text) {
-        return cssbeautify(text, {
-            indent: '  ',
-            openbrace: 'separate-line',
-            autosemicolon: true
+    var beautifulScss = function(text) {
+        return css_beautify(text, {
+            'indent_size': 1,
+            'indent_char': '\t',
+            'selector_separator': ' ',
+            'end_with_newline': false,
+            'newline_between_rules': true
         });
     };
     // The command has been defined in the package.json file
     // Now provide the implementation of the command with  registerCommand
     // The commandId parameter must match the command field in package.json
-    var formatSCSS = vscode.commands.registerCommand('extension.formatscss', function () {
+    var formatSCSS = vscode.commands.registerCommand('extension.formatscss', function() {
         var editor = vscode.window.activeTextEditor;
         if (!editor) {
             return; // No open text editor
@@ -456,26 +439,30 @@ function activate(context) {
                 text = beautifulScss(text);
                 var start = editor.document.positionAt(0);
                 var end = editor.document.positionAt(length);
-                editor.edit(function (e) {
+                editor.edit(function(e) {
                     e.replace(new vscode.Range(start, end), text);
                 });
             }
         }
     });
-    var compileSCSS = vscode.commands.registerCommand('extension.compilescss', function () {
+    var compileSCSS = vscode.commands.registerCommand('extension.compilescss', function() {
         var editor = vscode.window.activeTextEditor;
         if (!editor) {
             return; // No open text editor
         }
+
+
         if (editor.document.languageId !== 'sass')
             return;
-        var filename = editor.document.fileName;
-        sass.render({
+        var filename = "/home/psycho/RESOURCE/归档/web/static/scss/index.scss";
+
+
+        ass.render({
             file: filename,
             outputStyle: "compact"
-        }, function (err, result) {
+        }, function(err, result) {
             if (err) {
-                vscode.window.showErrorMessage(err);
+                vscode.window.showInformationMessage("Error: " + err);
                 return;
             }
             var pos = filename.lastIndexOf('.');
